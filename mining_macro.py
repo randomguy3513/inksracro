@@ -496,6 +496,18 @@ def is_ore_cursor(h, baseline):
     return bool(h) and bool(baseline) and h != baseline
 
 
+def _mode_handle(handles):
+    # the cursor that shows up most across probe points is the "normal" one;
+    # anything different is a candidate for the ore/pickaxe cursor.
+    counts = {}
+    for h in handles:
+        if h:
+            counts[h] = counts.get(h, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
 def lighten(hexc, f=1.18):
     try:
         hexc = hexc.lstrip("#")
@@ -876,18 +888,32 @@ def go_to_ore():
     found = False
     try:
         cx, cy = state["center"] if state["center"] else screen_center()
+        oc = state.get("ore_cursor")
         with input_lock:
+            focus_roblox()         # Roblox only updates its cursor when active
+            time.sleep(0.1)
             user32.SetCursorPos(cx, cy)
             time.sleep(0.25)
-            baseline = cursor_handle()
+            base = []
+            for _ in range(6):
+                base.append(cursor_handle())
+                time.sleep(0.03)
+            baseline = _mode_handle(base)
+            if oc and baseline and oc == baseline:
+                oc = None      # calibration grabbed the normal cursor; ignore it
+
+            def hit(h):
+                if oc:
+                    return bool(h) and h == oc
+                return bool(h) and bool(baseline) and h != baseline
+
             sweeps = 0
             while sweeps < MAX_SWEEPS and not state["quit"]:
                 _key(SCAN_W, False)
                 t_end = time.time() + WALK_TIMEOUT
                 while time.time() < t_end and not state["quit"]:
                     user32.SetCursorPos(cx, cy)
-                    h = cursor_handle()
-                    if is_ore_cursor(h, baseline):
+                    if hit(cursor_handle()):
                         found = True
                         break
                     time.sleep(0.1)
@@ -897,12 +923,10 @@ def go_to_ore():
                 rotate_camera(CAM_DX)
                 time.sleep(0.3)
                 sweeps += 1
-        if found:
-            state["center"] = (cx, cy)
-            state["running"] = True
-            set_status("found ore - mining")
-        else:
-            set_status("no ore found - hover + F2")
+        # whether or not we spotted the ore cursor, end up mining at this spot
+        state["center"] = (cx, cy)
+        state["running"] = True
+        set_status("found ore - mining" if found else "no ore cursor - mining at center")
     finally:
         try:
             _key(SCAN_W, True)
@@ -912,37 +936,67 @@ def go_to_ore():
 
 
 def auto_find_ore():
-    """Probe random spots until the cursor becomes the pickaxe, then mine."""
+    """Probe the play area for Roblox's pickaxe cursor. Roblox only swaps the
+    cursor while it is the active window, so we focus it first and give each
+    probe a moment to register. If we still can't tell, mine at screen center."""
     if state["go_busy"]:
         return
     state["go_busy"] = True
     state["running"] = False
-    found = False
+    found = None
     try:
         w, h = screen_size()
+        oc = state.get("ore_cursor")
+        cxc, cyc = screen_center()
+        pts = [(cxc, cyc)]                       # ore is usually dead-center
+        for gy in (0.40, 0.48, 0.56, 0.64):
+            for gx in (0.40, 0.46, 0.52, 0.58, 0.64):
+                pts.append((int(w * gx), int(h * gy)))
+        for _ in range(24):
+            pts.append((random.randint(int(w * 0.28), int(w * 0.72)),
+                        random.randint(int(h * 0.32), int(h * 0.74))))
+        probes = []
         with input_lock:
-            user32.SetCursorPos(w // 2, int(h * 0.10))
+            focus_roblox()                       # so Roblox actually shows cursor
             time.sleep(0.15)
-            baseline = cursor_handle()
-            for _ in range(MAX_PROBES):
+            for (x, y) in pts:
                 if state["quit"]:
                     break
-                x = random.randint(int(w * 0.28), int(w * 0.72))
-                y = random.randint(int(h * 0.34), int(h * 0.74))
                 user32.SetCursorPos(x, y)
-                time.sleep(0.06)
-                hc = cursor_handle()
-                if is_ore_cursor(hc, baseline):
-                    time.sleep(0.05)
-                    if cursor_handle() == hc:
-                        state["center"] = (x, y)
-                        found = True
-                        break
+                time.sleep(0.12)                 # let Roblox swap to the pickaxe
+                probes.append((x, y, cursor_handle()))
+
+            normal = _mode_handle([p[2] for p in probes])
+            if oc and normal and oc == normal:
+                oc = None      # calibration grabbed the normal cursor; ignore it
+
+            for (x, y, hc) in probes:
+                if not hc:
+                    continue
+                is_hit = (hc == oc) if oc else (normal is not None and hc != normal)
+                if not is_hit:
+                    continue
+                user32.SetCursorPos(x, y)        # confirm it holds
+                time.sleep(0.08)
+                if cursor_handle() == hc:
+                    found = (x, y)
+                    break
+
         if found:
+            state["center"] = found
             state["running"] = True
             set_status("ore found - mining @ %ss" % state["hold"])
         else:
-            set_status("no ore found - hover + F2 to set it")
+            cx, cy = state["center"] if state["center"] else screen_center()
+            state["center"] = (cx, cy)
+            try:
+                with input_lock:
+                    focus_roblox()
+                    user32.SetCursorPos(int(cx), int(cy))
+            except Exception:
+                pass
+            state["running"] = True
+            set_status("no ore detected - mining at center")
     finally:
         state["go_busy"] = False
 

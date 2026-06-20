@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+racro_config.json
+.vscode/
+.idea/
+.DS_Store
