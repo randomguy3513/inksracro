@@ -1,4 +1,4 @@
-# Racro
+# Racro (v1.3)
 
 **An auto-miner for the elected-Administrator mining game — grind credits while you sleep.**
 
