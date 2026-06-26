@@ -2,7 +2,7 @@
 Ink's Racro -- mining macro with a dark control panel.
 
 Features
-  * Speed dropdown (Level 1 / 2 / 12), Start (auto-finds the ore), Stop, F2.
+  * Speed dropdown (Level 1 / 2 / 14), Start (auto-finds the ore), Stop, F2.
   * Auto-find ore: probes the screen until the cursor turns into the pickaxe.
   * Auto-rejoin: paste a server link; resolves to a deep link (grabs your
     Roblox login automatically for /share links) and rejoins on crash.
@@ -43,7 +43,7 @@ except Exception:
 LEVELS = [
     ("Level 1  -  slow  (3.5s)", 3.5),
     ("Level 2  -  medium (2.8s)", 2.8),
-    ("Level 12 -  fast  (2.2s)", 2.2),
+    ("Level 14 -  fast  (2.2s)", 2.2),
 ]
 DEFAULT_LEVEL = 1
 RELEASE_GAP   = 0.05
@@ -348,6 +348,7 @@ SCAN_A = 0x1E
 SCAN_V = 0x2F
 SCAN_LCTRL = 0x1D
 CHAT_BACKSPACES = 40
+M16_KEYS = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B]  # 1..9,0
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
 
@@ -520,13 +521,18 @@ def lighten(hexc, f=1.18):
 
 
 def add_glow(w):
-    # cheap hover "glow": brighten the button while the pointer is over it.
+    # hover "glow": brighten the button and light up a soft ring around it.
+    # a constant 2px highlight border keeps the size stable - only the colour
+    # changes, so the button appears to glow like a little light.
     def on_enter(_):
         if not state.get("glow", True):
             return
         try:
             w._g = w.cget("bg")
-            w.config(bg=lighten(w._g, 1.18))
+            w._hb = w.cget("highlightbackground")
+            glow = lighten(w._g, 1.7)
+            w.config(bg=lighten(w._g, 1.2), highlightbackground=glow,
+                     highlightcolor=glow)
         except Exception:
             pass
 
@@ -534,6 +540,8 @@ def add_glow(w):
         try:
             if getattr(w, "_g", None):
                 w.config(bg=w._g)
+            if getattr(w, "_hb", None) is not None:
+                w.config(highlightbackground=w._hb, highlightcolor=w._hb)
         except Exception:
             pass
 
@@ -669,7 +677,7 @@ def resolve_link(text, cookie=""):
 
 
 # ---- shared state ----
-VERSION = "v1.3"
+VERSION = "v1.4"
 
 state = {
     "running": False, "quit": False, "go_busy": False, "rejoining": False,
@@ -680,7 +688,9 @@ state = {
     "auto_walk": False, "disc_detect": True,
     "auto_pay": False, "pay_host": "", "mine_count": 0,
     "ore_cursor": None, "kb_mine": "f2", "glow": True,
-    "show": {}, "compact": False,
+    "show": {}, "compact": False, "minimal": False,
+    "m16": False, "kb_m16": "c", "kb_kill": "f8", "m16_enabled": False,
+    "m16_slots": 6,
 }
 
 ui = {"root": None, "status": None}
@@ -717,6 +727,11 @@ def load_config():
         state["kb_mine"] = c.get("kb_mine", "f2") or "f2"
         state["show"] = c.get("show", {}) or {}
         state["compact"] = bool(c.get("compact", False))
+        state["minimal"] = bool(c.get("minimal", False))
+        state["kb_m16"] = c.get("kb_m16", "c") or "c"
+        state["kb_kill"] = c.get("kb_kill", "f8") or "f8"
+        state["m16_enabled"] = bool(c.get("m16_enabled", False))
+        state["m16_slots"] = max(1, min(10, int(c.get("m16_slots", 6))))
     except Exception:
         pass
 
@@ -731,7 +746,8 @@ def save_config():
              "disc_detect": state["disc_detect"],
              "pay_host": state["pay_host"],
              "glow": state["glow"], "kb_mine": state["kb_mine"],
-             "show": state["show"], "compact": state["compact"]}
+             "show": state["show"], "compact": state["compact"],
+             "minimal": state["minimal"], "kb_m16": state["kb_m16"], "kb_kill": state["kb_kill"], "m16_enabled": state["m16_enabled"], "m16_slots": state["m16_slots"]}
         with open(CONFIG, "w", encoding="utf-8") as f:
             json.dump(c, f)
     except Exception:
@@ -1014,8 +1030,181 @@ AMBER = "#f3c969"
 
 
 
+def roblox_is_active():
+    # True only when the Roblox window is the foreground window.
+    try:
+        hwnd = user32.FindWindowW(None, ROBLOX_TITLE)
+        return bool(hwnd) and user32.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+
+def m16_loop():
+    """'m16 brr': while toggled on, autoclick fast and cycle number keys 1-6.
+    Roblox needs to be the active window (same as mining)."""
+    i = 0
+    while not state["quit"]:
+        if not state.get("m16"):
+            time.sleep(0.05)
+            continue
+        if not roblox_is_active():     # only ever fire while Roblox is focused
+            time.sleep(0.05)
+            continue
+        slots = max(1, min(10, int(state.get("m16_slots", 6))))
+        try:
+            with input_lock:
+                _key(M16_KEYS[i % slots], False)   # switch slot first
+                _key(M16_KEYS[i % slots], True)
+                time.sleep(0.05)                   # let the gun fully equip
+                _send(MOUSEEVENTF_LEFTDOWN)        # then a single click
+                _send(MOUSEEVENTF_LEFTUP)
+            i += 1
+        except Exception:
+            pass
+        time.sleep(0.1)                # gentle pacing so guns don't jam
+
+
+def panic_kill():
+    """Emergency stop: halt mining, autofire, vote and pay, and release any
+    held inputs. Bound to a global hotkey so it works even when Roblox has
+    focus."""
+    state["running"] = False
+    state["m16"] = False
+    state["auto_vote"] = False
+    state["auto_pay"] = False
+    try:
+        _send(MOUSEEVENTF_LEFTUP)
+        _key(SCAN_W, True)
+    except Exception:
+        pass
+    set_status("KILLED - all activity stopped")
+
+
+def minimal_main():
+    """A stripped-down, low-overhead window: just mine controls. No themes,
+    images, glow, overlays or flooder - for people who want to optimise."""
+    threading.Thread(target=mine_loop, daemon=True).start()
+    threading.Thread(target=m16_loop, daemon=True).start()
+    if WATCHDOG and state.get("deeplink"):
+        threading.Thread(target=watchdog_loop, daemon=True).start()
+        threading.Thread(target=popup_loop, daemon=True).start()
+
+    root = tk.Tk()
+    root.title("Racro (minimal)")
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+    root.geometry("+20+20")
+    root.configure(bg=BG)
+    status = tk.StringVar(value="minimal mode - ready")
+    ui["root"] = root
+    ui["status"] = status
+
+    wrap = tk.Frame(root, bg=BG)
+    wrap.pack(padx=12, pady=12)
+    tk.Label(wrap, text="Racro " + VERSION, fg=ACCENT, bg=BG,
+             font=("Segoe UI", 11, "bold")).pack(anchor="w")
+
+    labels = [l for l, _ in LEVELS]
+    sel = tk.StringVar(value=labels[DEFAULT_LEVEL])
+
+    def on_level(c):
+        for l, v in LEVELS:
+            if l == c:
+                state["hold"] = v
+        status.set("speed: %ss" % state["hold"])
+
+    om = tk.OptionMenu(wrap, sel, *labels, command=on_level)
+    om.config(bg=ENTRY, fg=FG, activebackground=ACCENT, activeforeground="#1a1320",
+              relief="flat", bd=0, highlightthickness=0, font=("Segoe UI", 8), width=18)
+    om.pack(fill="x", pady=5)
+
+    def mk(txt, cmd):
+        return tk.Button(wrap, text=txt, command=cmd, bg=ACCENT, fg="#1a1320",
+                         activebackground=ACCENT, activeforeground="#1a1320",
+                         relief="flat", bd=0, font=("Segoe UI", 8, "bold"),
+                         cursor="hand2", padx=6, pady=3)
+
+    def do_start():
+        status.set("finding ore...")
+        threading.Thread(target=auto_find_ore, daemon=True).start()
+
+    def do_stop():
+        state["running"] = False
+        status.set("stopped")
+
+    mk("Start", do_start).pack(fill="x", pady=2)
+    mk("Stop", do_stop).pack(fill="x", pady=2)
+
+    def calib():
+        def cap():
+            state["ore_cursor"] = cursor_handle()
+            status.set("cursor locked" if state["ore_cursor"] else "no cursor")
+
+        def cd(n):
+            if n > 0:
+                status.set("hover ore... %d" % n)
+                root.after(1000, lambda: cd(n - 1))
+            else:
+                cap()
+        cd(3)
+
+    mk("Calibrate ore-cursor", calib).pack(fill="x", pady=(2, 0))
+    tk.Label(wrap, textvariable=status, fg=MUTED, bg=BG,
+             font=("Segoe UI", 8)).pack(anchor="w", pady=(6, 0))
+
+    if HAVE_KEYBOARD:
+        def f2():
+            if state["running"]:
+                state["running"] = False
+                try:
+                    _send(MOUSEEVENTF_LEFTUP)
+                except Exception:
+                    pass
+                set_status("stopped (hotkey)")
+            else:
+                state["center"] = cursor_pos()
+                state["running"] = True
+                set_status("mining - hotkey to stop")
+        try:
+            keyboard.add_hotkey(state.get("kb_mine", "f2"), f2)
+        except Exception:
+            pass
+
+        def _m16():
+            state["m16"] = not state.get("m16", False)
+            set_status("m16 brr " + ("ON" if state["m16"] else "off"))
+        if state.get("m16_enabled"):
+            try:
+                keyboard.add_hotkey(state.get("kb_m16", "c"), _m16)
+            except Exception:
+                pass
+
+        def _kill():
+            panic_kill()
+        try:
+            keyboard.add_hotkey(state.get("kb_kill", "f8"), _kill)
+        except Exception:
+            pass
+
+    def on_close():
+        state["quit"] = True
+        try:
+            _send(MOUSEEVENTF_LEFTUP)
+            _key(SCAN_W, True)
+        except Exception:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
+
+
+
 def main():
     load_config()
+    if state.get("minimal"):
+        minimal_main()
+        return
     if len(sys.argv) > 1:
         try:
             state["hold"] = float(sys.argv[1])
@@ -1027,6 +1216,7 @@ def main():
 
     threading.Thread(target=mine_loop, daemon=True).start()
     threading.Thread(target=vote_loop, daemon=True).start()
+    threading.Thread(target=m16_loop, daemon=True).start()
     if WATCHDOG:
         threading.Thread(target=watchdog_loop, daemon=True).start()
         threading.Thread(target=popup_loop, daemon=True).start()
@@ -1049,8 +1239,9 @@ def main():
     def B(parent, text, cmd, bg=ACCENT, fg="#1a1320"):
         return add_glow(tk.Button(parent, text=text, command=cmd, bg=ACCENT, fg=fg,
                         activebackground=ACCENT, activeforeground=fg, relief="flat",
-                        bd=0, font=("Segoe UI", 8, "bold"), cursor="hand2",
-                        padx=6, pady=3))
+                        bd=0, highlightthickness=2, highlightbackground=CARD,
+                        highlightcolor=CARD, font=("Segoe UI", 8, "bold"),
+                        cursor="hand2", padx=6, pady=3))
 
     def E(parent, var, show=None, width=22):
         return tk.Entry(parent, textvariable=var, width=width, show=show,
@@ -1071,12 +1262,35 @@ def main():
         root.geometry("+%d+%d" % (root.winfo_pointerx() - root._dx,
                                   root.winfo_pointery() - root._dy))
 
+    GWL_EXSTYLE = -20
+    WS_EX_APPWINDOW = 0x00040000
+    WS_EX_TOOLWINDOW = 0x00000080
+
+    def _hwnd():
+        return user32.GetParent(root.winfo_id())
+
+    def _set_appwindow():
+        try:
+            hwnd = _hwnd()
+            st = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            st = (st & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, st)
+            root.withdraw()
+            root.after(10, root.deiconify)
+        except Exception:
+            pass
+
     def _minimize():
-        root.overrideredirect(False)
-        root.iconify()
+        try:
+            user32.ShowWindow(_hwnd(), 6)   # SW_MINIMIZE -> real taskbar minimise
+        except Exception:
+            try:
+                root.overrideredirect(False)
+                root.iconify()
+            except Exception:
+                pass
 
     def _restore(_=None):
-        root.overrideredirect(True)
         root.attributes("-topmost", True)
     root.bind("<Map>", _restore)
 
@@ -1091,8 +1305,9 @@ def main():
     def _ctrl(txt, cmd):
         return add_glow(tk.Button(topbar, text=txt, command=cmd, bg=CARD, fg=MUTED,
                         activebackground=ACCENT, activeforeground="#1a1320",
-                        relief="flat", bd=0, font=("Segoe UI", 9), cursor="hand2",
-                        padx=8))
+                        relief="flat", bd=0, highlightthickness=2,
+                        highlightbackground=CARD, highlightcolor=CARD,
+                        font=("Segoe UI", 9), cursor="hand2", padx=8))
     _ctrl("\u2715", lambda: on_close()).pack(side="right")
     _ctrl("\u2013", _minimize).pack(side="right")
     _ctrl("\u2699", lambda: open_settings()).pack(side="right")
@@ -1130,7 +1345,7 @@ def main():
     def column():
         outer = tk.Frame(body, bg=CARD)
         inner = tk.Frame(outer, bg=CARD)
-        inner.pack(padx=10, pady=9)
+        inner.pack(padx=8, pady=7)
         return outer, inner
 
     # --- column 1: MINE ---
@@ -1179,8 +1394,7 @@ def main():
         cd(3)
 
     B(c1, "Calibrate ore-cursor", calib_cursor).pack(fill="x", pady=(4, 0))
-    L(c1, "Lock the exact pickaxe\ncursor for reliable finds.\nF2 = start / stop.",
-      MUTED, 7).pack(anchor="w", pady=(6, 0))
+    L(c1, "F2 = start / stop.", MUTED, 7).pack(anchor="w", pady=(6, 0))
 
     # --- column 2: REJOIN ---
     c2o, c2 = column()
@@ -1228,7 +1442,36 @@ def main():
     B(wrow, "Go", lambda: threading.Thread(target=go_to_ore, daemon=True).start(),
       AMBER).pack(side="right")
 
-    # --- column 3: VOTE + PAY ---
+    tk.Frame(c2, bg=ENTRY, height=1).pack(fill="x", pady=6)
+    L(c2, "AUTO-PAY", ACCENT, 8, True).pack(anchor="w")
+    pay_var = tk.BooleanVar(value=False)
+    host_var = tk.StringVar(value=state["pay_host"])
+
+    def on_pay():
+        state["pay_host"] = host_var.get().strip()
+        save_config()
+        if pay_var.get():
+            if not state["pay_host"]:
+                pay_var.set(False)
+                status.set("enter the host name first")
+                return
+            state["auto_pay"] = True
+            status.set("auto-pay ON")
+        else:
+            state["auto_pay"] = False
+            status.set("auto-pay off")
+
+    C(c2, "Pay host every %dk mines" % (PAY_EVERY // 1000), pay_var, on_pay).pack(
+        anchor="w")
+    prow = tk.Frame(c2, bg=CARD)
+    prow.pack(fill="x", pady=(1, 0))
+    L(prow, "host:", MUTED, 8).pack(side="left", padx=(0, 3))
+    he = E(prow, host_var, width=14)
+    he.pack(side="left", fill="x", expand=True)
+    he.bind("<FocusOut>", lambda e: on_pay() if pay_var.get()
+            else state.update(pay_host=host_var.get().strip()))
+
+    # --- column 3: VOTE ---
     c3o, c3 = column()
     L(c3, "AUTO-VOTE", ACCENT, 8, True).pack(anchor="w")
     auto_vote_var = tk.BooleanVar(value=False)
@@ -1308,45 +1551,58 @@ def main():
     tk.Label(c3, textvariable=warn, fg=RED, bg=CARD, font=("Segoe UI", 7),
              wraplength=150).pack(anchor="w")
 
-    tk.Frame(c3, bg=ENTRY, height=1).pack(fill="x", pady=7)
-
-    L(c3, "AUTO-PAY", ACCENT, 8, True).pack(anchor="w")
-    pay_var = tk.BooleanVar(value=False)
-    host_var = tk.StringVar(value=state["pay_host"])
-
-    def on_pay():
-        state["pay_host"] = host_var.get().strip()
-        save_config()
-        if pay_var.get():
-            if not state["pay_host"]:
-                pay_var.set(False)
-                status.set("enter the host name first")
-                return
-            state["auto_pay"] = True
-            status.set("auto-pay ON")
-        else:
-            state["auto_pay"] = False
-            status.set("auto-pay off")
-
-    C(c3, "Pay host every %dk mines" % (PAY_EVERY // 1000), pay_var, on_pay).pack(
-        anchor="w")
-    prow = tk.Frame(c3, bg=CARD)
-    prow.pack(fill="x", pady=(1, 0))
-    L(prow, "host:", MUTED, 8).pack(side="left", padx=(0, 3))
-    he = E(prow, host_var, width=14)
-    he.pack(side="left", fill="x", expand=True)
-    he.bind("<FocusOut>", lambda e: on_pay() if pay_var.get()
-            else state.update(pay_host=host_var.get().strip()))
-
     # ---------- layout / compact ----------
+    # --- m16 brr section ---
+    cm16o, cm16 = column()
+    L(cm16, "M16 BRR", ACCENT, 8, True).pack(anchor="w")
+    m16_slots_var = tk.IntVar(value=int(state.get("m16_slots", 6)))
+
+    def on_slots(v):
+        state["m16_slots"] = max(1, min(10, int(float(v))))
+        save_config()
+
+    srow = tk.Frame(cm16, bg=CARD)
+    srow.pack(fill="x", pady=(3, 0))
+    L(srow, "slots", MUTED, 8).pack(side="left")
+    tk.Scale(srow, from_=1, to=10, orient="horizontal", variable=m16_slots_var,
+             command=on_slots, showvalue=True, length=92, bg=CARD, fg=FG,
+             troughcolor=ENTRY, highlightthickness=0, relief="flat", bd=0,
+             activebackground=ACCENT, font=("Segoe UI", 7)).pack(side="left", padx=(4, 0))
+    m16on_var = tk.BooleanVar(value=state.get("m16_enabled", False))
+
+    def on_m16on():
+        state["m16_enabled"] = m16on_var.get()
+        save_config()
+        register_hotkey()
+        status.set("m16 hotkey " + ("enabled" if state["m16_enabled"] else "disabled"))
+    C(cm16, "enable hotkey", m16on_var, on_m16on).pack(anchor="w")
+    krow = tk.Frame(cm16, bg=CARD)
+    krow.pack(fill="x", pady=(2, 0))
+    L(krow, "key", MUTED, 8).pack(side="left")
+    m16key_var = tk.StringVar(value=state.get("kb_m16", "c"))
+    E(krow, m16key_var, width=6).pack(side="left", padx=2)
+
+    def apply_m16k():
+        k = m16key_var.get().strip().lower() or "c"
+        state["kb_m16"] = k
+        save_config()
+        register_hotkey()
+        status.set("m16 key = " + k)
+    B(krow, "Set", apply_m16k).pack(side="left", padx=(2, 0))
+
     def relayout():
-        for o in (c1o, c2o, c3o):
-            o.pack_forget()
-        c1o.pack(side="left", padx=5, anchor="n")
+        order = [c1o]
         if state["show"].get("rejoin", True):
-            c2o.pack(side="left", padx=5, anchor="n")
+            order.append(c2o)
         if state["show"].get("votepay", True):
-            c3o.pack(side="left", padx=5, anchor="n")
+            order.append(c3o)
+        if state["show"].get("m16", True):
+            order.append(cm16o)
+        for o in (c1o, c2o, c3o, cm16o):
+            o.grid_forget()
+        cols = 2
+        for idx, o in enumerate(order):
+            o.grid(row=idx // cols, column=idx % cols, padx=4, pady=4, sticky="n")
 
     # ---------- hotkey ----------
     def f2_toggle():
@@ -1362,20 +1618,38 @@ def main():
             state["running"] = True
             set_status("mining - tap hotkey again to STOP")
 
-    hk = {"h": None}
+    def _toggle_m16():
+        state["m16"] = not state.get("m16", False)
+        set_status("m16 brr " + ("ON - tap key to stop" if state["m16"] else "off"))
+
+    def _kill():
+        panic_kill()
+
+    hk = {"mine": None, "m16": None, "kill": None}
 
     def register_hotkey():
         if not HAVE_KEYBOARD:
             return
+        for k in ("mine", "m16", "kill"):
+            try:
+                if hk[k] is not None:
+                    keyboard.remove_hotkey(hk[k])
+            except Exception:
+                pass
+            hk[k] = None
         try:
-            if hk["h"] is not None:
-                keyboard.remove_hotkey(hk["h"])
+            hk["mine"] = keyboard.add_hotkey(state["kb_mine"], f2_toggle)
         except Exception:
             pass
+        if state.get("m16_enabled"):
+            try:
+                hk["m16"] = keyboard.add_hotkey(state.get("kb_m16", "c"), _toggle_m16)
+            except Exception:
+                pass
         try:
-            hk["h"] = keyboard.add_hotkey(state["kb_mine"], f2_toggle)
+            hk["kill"] = keyboard.add_hotkey(state.get("kb_kill", "f8"), _kill)
         except Exception:
-            hk["h"] = None
+            pass
 
     # ---------- settings window ----------
     def open_settings():
@@ -1405,6 +1679,21 @@ def main():
         if not HAVE_KEYBOARD:
             L(pad, "install 'keyboard' for hotkeys", RED, 7).pack(anchor="w")
 
+        L(pad, "KILL / abort hotkey (stops everything)", FG, 8, True).pack(
+            anchor="w", pady=(10, 0))
+        kl_var = tk.StringVar(value=state.get("kb_kill", "f8"))
+        klrow = tk.Frame(pad, bg=CARD)
+        klrow.pack(anchor="w", pady=(2, 0))
+        E(klrow, kl_var, width=12).pack(side="left")
+
+        def apply_kill():
+            k = kl_var.get().strip().lower() or "f8"
+            state["kb_kill"] = k
+            save_config()
+            register_hotkey()
+            status.set("kill hotkey set to " + k)
+        B(klrow, "Apply", apply_kill).pack(side="left", padx=6)
+
         glow_var = tk.BooleanVar(value=state["glow"])
 
         def on_glow():
@@ -1415,20 +1704,75 @@ def main():
         L(pad, "Show sections (compact)", FG, 8, True).pack(anchor="w", pady=(8, 0))
         rj_var = tk.BooleanVar(value=state["show"].get("rejoin", True))
         vp_var = tk.BooleanVar(value=state["show"].get("votepay", True))
+        sm16_var = tk.BooleanVar(value=state["show"].get("m16", True))
 
         def on_show():
             state["show"]["rejoin"] = rj_var.get()
             state["show"]["votepay"] = vp_var.get()
+            state["show"]["m16"] = sm16_var.get()
             save_config()
             relayout()
-        C(pad, "Auto-Rejoin", rj_var, on_show).pack(anchor="w")
-        C(pad, "Vote & Pay", vp_var, on_show).pack(anchor="w")
+        C(pad, "Rejoin + Pay", rj_var, on_show).pack(anchor="w")
+        C(pad, "Auto-Vote", vp_var, on_show).pack(anchor="w")
+        C(pad, "M16 brr", sm16_var, on_show).pack(anchor="w")
+
+        mn_var = tk.BooleanVar(value=state["minimal"])
+
+        def on_min():
+            state["minimal"] = mn_var.get()
+            save_config()
+            status.set("minimal mode " + ("ON" if mn_var.get() else "off")
+                       + " - restart to apply")
+        C(pad, "Load minimal mode (restart)", mn_var, on_min).pack(
+            anchor="w", pady=(10, 0))
 
         B(pad, "Close", win.destroy).pack(anchor="e", pady=(12, 0))
 
     relayout()
     update_warn()
     register_hotkey()
+
+    # ---- out-of-focus resource-saver overlay ----
+    overlay = tk.Frame(root, bg=CARD)
+    ov_lbl = tk.Label(overlay, fg=ACCENT, bg=CARD, justify="center",
+                      font=("Segoe UI", 11, "bold"))
+    ov_lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+    def show_overlay():
+        try:
+            ov_lbl.config(text="Saving resources for ya, click to go back :)\n"
+                               "[Press %s to abort mining]" % state["kb_mine"].upper())
+            overlay.place(x=0, y=0, relwidth=1, relheight=1)
+            overlay.lift()
+        except Exception:
+            pass
+
+    def hide_overlay():
+        try:
+            overlay.place_forget()
+        except Exception:
+            pass
+
+    def _back(_=None):
+        try:
+            root.focus_force()
+        except Exception:
+            pass
+        hide_overlay()
+    overlay.bind("<Button-1>", _back)
+    ov_lbl.bind("<Button-1>", _back)
+
+    def _check_focus():
+        try:
+            if state["running"] and root.focus_get() is None:
+                show_overlay()
+        except Exception:
+            pass
+
+    root.bind("<FocusOut>", lambda e: root.after(150, _check_focus))
+    root.bind("<FocusIn>", lambda e: hide_overlay())
+
+    root.after(60, _set_appwindow)
 
     def on_close():
         state["quit"] = True
